@@ -12,9 +12,10 @@ from scipy.stats import sigmaclip
 class LightCurve:
     def __init__(self, t, flux, yerr=None):
         self.t = t
-        self.flux = flux
         self.raw_flux = flux
         self.varnames = ["mix", "logdeltaQ", "logQ0", "logperiod", "logamp", "logs2", "mean"]
+        self.flux = None
+        self.trend = None
         self.model = None
         self.map_soln = None
         self.trace = None
@@ -31,33 +32,32 @@ class LightCurve:
         m = (data["QUALITY"] == 0) & np.isfinite(t) & np.isfinite(flux)
         t = np.ascontiguousarray(t[m], dtype=np.float64)
         flux = np.ascontiguousarray(flux[m], dtype=np.float64)
-        flux = (flux-np.median(flux))/np.median(flux)
         return cls(t, flux)
     
     def compute(self):
-        self.subtract_trend(3)
+        self.trend = self.get_trend(3)
+        self.flux = (self.raw_flux-self.trend)/np.median(self.raw_flux)
         self.model, self.map_soln = self.build_model()
         self.trace = self.mcmc()
         self.mcmc_summary = pm.summary(self.trace, varnames=self.varnames)
         self.computed = True
     
-    def plot(self):
-        fig = plt.figure()
-        plt.plot(self.t, self.flux, 'k.')
-        return fig
+    def plot(self, ax):
+        ax.plot(self.t, self.flux, 'k.')
+        return ax
     
-    def plot_raw(self):
-        fig = plt.figure()
-        plt.plot(self.t, self.raw_flux, 'k.')
-        return fig
+    def plot_raw(self, ax, plot_trend=True):
+        ax.plot(self.t, self.raw_flux, 'k.')
+        if plot_trend:
+            ax.plot(self.t, self.trend)
+        return ax
     
-    def plot_map_soln(self):
+    def plot_map_soln(self, ax):
         if not self.computed:
             raise Exception("Must first call compute()")
-        fig = plt.figure()
-        plt.plot(self.t, self.flux, 'k.', alpha=0.2)
-        plt.plot(self.t, self.map_soln["pred"])
-        return fig
+        ax.plot(self.t, self.flux, 'k.', alpha=0.2)
+        ax.plot(self.t, self.map_soln["pred"])
+        return ax
     
     def plot_corner(self):
         if not self.computed:
@@ -66,12 +66,8 @@ class LightCurve:
         return corner.corner(samples)
     
     def get_trend(self, n):
-        res = np.polyfit(self.t, self.flux, n)
+        res = np.polyfit(self.t, self.raw_flux, n)
         return sum([c*(self.t**i) for (i, c) in enumerate(res[::-1])])
-    
-    def subtract_trend(self, n):
-        trend = self.get_trend(n)
-        self.flux = self.flux - trend
         
     def autocor(self, max_peaks=1, min_period=0.5, max_period=100):
         results = xo.autocorr_estimator(self.t, self.flux, 
@@ -82,12 +78,12 @@ class LightCurve:
         peaks = results["peaks"]
         return lags, power, peaks
     
-    def plot_autocor(self, max_peaks=1, min_period=0.5, max_period=100):
+    def plot_autocor(self, ax, max_peaks=1, min_period=0.5, max_period=100):
         lags, power, peaks = self.autocor(max_peaks=max_peaks, min_period=min_period, max_period=max_period)
         fig = plt.figure()
-        plt.plot(lags, power, "k")
-        plt.axvline(peaks[0]["period"], color="k", lw=4, alpha=0.3)
-        return fig
+        ax.plot(lags, power, "k")
+        ax.axvline(peaks[0]["period"], color="k", lw=4, alpha=0.3)
+        return ax
     
     def estimate_yerr(self, kernel_size=21, sigma=3):
         filt = medfilt(self.flux, kernel_size=kernel_size)
