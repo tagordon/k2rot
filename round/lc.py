@@ -13,7 +13,7 @@ class LightCurve:
     def __init__(self, t, flux, yerr=None):
         self.t = t
         self.raw_flux = flux
-        self.varnames = ["mix", "logdeltaQ", "logQ0", "logperiod", "logamp", "logs2", "mean"]
+        self.varnames = ["mix", "logdeltaQ", "logQ0", "logperiod", "logamp", "logs2"]
         self.flux = None
         self.yerr = None
         self.trend = None
@@ -67,11 +67,11 @@ class LightCurve:
         ax.fill_between(t, mu+np.sqrt(var), mu-np.sqrt(var), *args, alpha=0.3, **kwargs)
         return ax
     
-    def plot_corner(self):
+    def plot_corner(self, *args, **kwargs):
         if not self.hasmcmc:
             raise Exception("Must first run mcmc by calling mcmc() or compute(mcmc=True) with mcmc=True")
-        samples = pm.trace_to_dataframe(self.trace, varnames=["mix", "logdeltaQ", "logQ0", "logperiod", "logamp", "logs2", "mean"])
-        return corner.corner(samples)
+        samples = pm.trace_to_dataframe(self.trace, varnames=["mix", "logdeltaQ", "logQ0", "logperiod", "logamp", "logs2"])
+        return corner.corner(samples, *args, **kwargs)
     
     def get_trend(self, n):
         res = np.polyfit(self.t, self.raw_flux, n)
@@ -89,9 +89,12 @@ class LightCurve:
     def plot_autocor(self, ax, *args, max_peaks=1, min_period=0.5, max_period=100, **kwargs):
         lags, power, peaks = self.autocor(max_peaks=max_peaks, min_period=min_period, max_period=max_period)
         fig = plt.figure()
-        ax.plot(lags, power, "k")
-        ax.axvline(peaks[0]["period"], color="k", lw=4, alpha=0.3)
+        ax.plot(lags, power, *args, **kwargs)
+        ax.axvline(peaks[0]["period"], color="#f55649", lw=5, alpha=0.6, label="chosen ACF peak")
         return ax
+    
+    #def clip_outliers(self):
+        
     
     def estimate_yerr(self, kernel_size=21, sigma=3):
         filt = medfilt(self.flux, kernel_size=kernel_size)
@@ -101,7 +104,7 @@ class LightCurve:
         lags, power, peaks = self.autocor()
         with pm.Model() as model:
 
-            mean = pm.Normal("mean", mu=0.0, sd=10.0)
+            #mean = pm.Normal("mean", mu=0.0, sd=10.0)
             logs2 = pm.Normal("logs2", mu=2*np.log(self.yerr[0]), sd=prior_sig)
 
             # The parameters of the RotationTerm kernel
@@ -127,7 +130,7 @@ class LightCurve:
 
             # Compute the Gaussian Process likelihood and add it into the
             # the PyMC3 model as a "potential"
-            pm.Potential("loglike", gp.log_likelihood(self.flux - mean))
+            pm.Potential("loglike", gp.log_likelihood(self.flux))
 
             # Compute the mean model prediction for plotting purposes
             pm.Deterministic("mu", gp.predict())
@@ -137,8 +140,9 @@ class LightCurve:
     def mcmc(self, draws=500, tune=500, target_accept=0.9):
         sampler = xo.PyMC3Sampler(finish=200)
         with self.model:
-            sampler.tune(tune=tune, start=self.map_soln, step_kwargs=dict(target_accept=target_accept))
+            sampler.tune(tune=tune, start=self.map_soln, step=xo.get_dense_nuts_step(), step_kwargs=dict(target_accept=target_accept))
             trace = sampler.sample(draws=draws)
+            #trace = pm.sample(tune=tune, draws=draws, step=xo.get_dense_nuts_step())
         return trace
     
     def predict(self, t=None, return_var=True):
@@ -153,6 +157,6 @@ class LightCurve:
                 mix=self.map_soln["mix"]
             )
             gp = xo.gp.GP(kernel, self.t, self.yerr**2 + tt.exp(self.map_soln["logs2"]), J=4)
-            gp.log_likelihood(self.flux - self.map_soln["mean"])
+            gp.log_likelihood(self.flux)
             mu, var = xo.eval_in_model(gp.predict(t, return_var=return_var), self.map_soln)
             return mu, var
