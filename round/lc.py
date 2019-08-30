@@ -8,13 +8,16 @@ import corner
 from scipy.optimize import curve_fit
 from scipy.signal import medfilt
 from scipy.stats import sigmaclip
+from astropy.stats import sigma_clip
 
 class LightCurve:
     def __init__(self, t, flux, yerr=None):
         self.t = t
+        self.raw_t = t
         self.raw_flux = flux
         self.varnames = ["mix", "logdeltaQ", "logQ0", "logperiod", "logamp", "logs2"]
         self.flux = None
+        self.masked = None
         self.yerr = None
         self.trend = None
         self.model = None
@@ -36,27 +39,58 @@ class LightCurve:
         flux = np.ascontiguousarray(flux[m], dtype=np.float64)
         return cls(t, flux)
     
-    def compute(self, mcmc=False, mcmc_draws=500, tune=500, target_accept=0.9, prior_sig=5.0):
+    def compute(self, mcmc=False, mcmc_draws=500, tune=500, target_accept=0.9, prior_sig=5.0, with_SHOTerm=False):
         self.trend = self.get_trend(3)
         self.flux = (self.raw_flux-self.trend)/np.median(self.raw_flux)
-        self.yerr = self.estimate_yerr()*np.ones(len(self.t))
-        self.model, self.map_soln = self.build_model(prior_sig=prior_sig)
+        self.masked, self.yerr = self.estimate_yerr()
+        self.flux = self.flux[self.masked == False]
+        self.t = self.t[self.masked == False]
+        self.yerr = self.yerr*np.ones(len(self.t))
+        self.model, self.map_soln = self.build_model(prior_sig=prior_sig, with_SHOTerm=with_SHOTerm)
         if mcmc:
             self.trace = self.mcmc(draws=mcmc_draws, tune=tune, target_accept=target_accept)
             self.mcmc_summary = pm.summary(self.trace, varnames=self.varnames)
             self.hasmcmc=True
         self.computed = True
+        
+    def build_mcmc_summary(self):
+        if not self.hasmcmc:
+            raise Exception("Must first run mcmc")
+        nvar = len(self.varnames)
+        ncols = 7
+        columns = ["variable\n", "mean\n", "sd\n", "mc_error\n", "hpd_2.5\n", "hpd_97.5\n", "n_eff\n", "Rhat\n"]
+        for i in range(nvar):
+            columns[0] += "\n{0}".format(self.varnames[i])
+        for i in range(ncols):
+            for j in range(nvar):
+                columns[i+1] += "\n{0:0.3f}".format(self.mcmc_summary.values[j, i])
+        return columns
+    
+    def build_det_summary(self):
+        if not self.hasmcmc:
+            raise Exception("Must first run mcmc")
+        names = ["period", "amplitude", "variance"]
+        summary = pm.summary(self.trace, varnames=names)
+        nvar = 3
+        ncols = 3
+        columns = ["variable\n", "mean\n", "sd\n", "mc_error\n"]
+        for i in range(nvar):
+            columns[0] += "\n{0}".format(names[i])
+        for i in range(ncols):
+            for j in range(nvar):
+                columns[i+1] += "\n{0:0.03e}".format(summary.values[j, i])
+        return columns
     
     def plot(self, ax, *args, **kwargs):
         ax.plot(self.t, self.flux, *args, **kwargs)
         return ax
     
     def plot_raw(self, ax, *args, **kwargs):
-        ax.plot(self.t, self.raw_flux, *args, **kwargs)
+        ax.plot(self.raw_t, self.raw_flux, *args, **kwargs)
         return ax
     
     def plot_trend(self, ax, *args, **kwargs):
-        ax.plot(self.t, self.trend, *args, **kwargs)
+        ax.plot(self.t, self.trend[self.masked == False], *args, **kwargs)
         return ax
     
     def plot_map_soln(self, ax, t=None, *args, **kwargs):
@@ -67,11 +101,24 @@ class LightCurve:
         ax.fill_between(t, mu+np.sqrt(var), mu-np.sqrt(var), *args, alpha=0.3, **kwargs)
         return ax
     
+    def plot_residuals(self, ax, *args, **kwargs):
+        if not self.computed:
+            raise Exception("Must first call compute()")
+        mu = self.predict(t=self.t, return_var=False)
+        ax.plot(self.t, self.flux-mu, *args, **kwargs)
+    
     def plot_corner(self, *args, **kwargs):
         if not self.hasmcmc:
             raise Exception("Must first run mcmc by calling mcmc() or compute(mcmc=True) with mcmc=True")
         samples = pm.trace_to_dataframe(self.trace, varnames=["mix", "logdeltaQ", "logQ0", "logperiod", "logamp", "logs2"])
-        return corner.corner(samples, *args, **kwargs)
+        columns = self.build_mcmc_summary()
+        corn = corner.corner(samples, *args, **kwargs)
+        for i in range(len(columns)):
+            plt.annotate(columns[i], xy=(0.25+0.08*i, 0.865), xycoords="figure fraction", fontsize=12)
+        columns = self.build_det_summary()
+        for i in range(len(columns)):
+            plt.annotate(columns[i], xy=(0.41+0.08*i, 0.76), xycoords="figure fraction", fontsize=12)
+        return corn
     
     def get_trend(self, n):
         res = np.polyfit(self.t, self.raw_flux, n)
@@ -91,16 +138,16 @@ class LightCurve:
         fig = plt.figure()
         ax.plot(lags, power, *args, **kwargs)
         ax.axvline(peaks[0]["period"], color="#f55649", lw=5, alpha=0.6, label="chosen ACF peak")
-        return ax
-    
-    #def clip_outliers(self):
-        
+        return ax        
     
     def estimate_yerr(self, kernel_size=21, sigma=3):
         filt = medfilt(self.flux, kernel_size=kernel_size)
-        return np.std(sigmaclip(self.flux-filt, low=sigma, high=sigma)[0])
+        longfilt = medfilt(self.flux, kernel_size=5*kernel_size)
+        clipped_arr = sigma_clip(self.flux-filt, sigma=sigma)
+        long_clipped_arr = sigma_clip(self.flux-longfilt, sigma=sigma)
+        return long_clipped_arr.mask, np.std(clipped_arr.data[clipped_arr.mask == 0])
     
-    def build_model(self, prior_sig=5.0):
+    def build_model(self, prior_sig=5.0, with_SHOTerm=True):
         lags, power, peaks = self.autocor()
         with pm.Model() as model:
 
@@ -114,9 +161,11 @@ class LightCurve:
             logQ0 = pm.Normal("logQ0", mu=1.0, sd=2*prior_sig)
             logdeltaQ = pm.Normal("logdeltaQ", mu=2.0, sd=2*prior_sig)
             mix = pm.Uniform("mix", lower=0, upper=1.0)
-
-            # Track the period as a deterministic
+            
+            # track deterministics
+            amplitude = pm.Deterministic("amplitude", tt.exp(logamp))
             period = pm.Deterministic("period", tt.exp(logperiod))
+            variance = pm.Deterministic("variance", tt.exp(logs2))
 
             # Set up the Gaussian Process model
             kernel = xo.gp.terms.RotationTerm(
@@ -126,14 +175,32 @@ class LightCurve:
                 log_deltaQ=logdeltaQ,
                 mix=mix
             )
-            gp = xo.gp.GP(kernel, self.t, self.yerr**2 + tt.exp(logs2), J=4)
+            
+            if with_SHOTerm:
+                
+                # parameters of the SHOTerm kernel 
+                logSHOamp = pm.Normal("logSHOamp", mu=np.log(np.var(self.flux)), sd=prior_sig)
+                w0Bound = pm.Bound(pm.Normal, lower=-4, upper=4)
+                logSHOw0 = w0Bound("logSHOw0", mu=-1.0, sd=2*prior_sig)
+                logS0 = pm.Deterministic("logS0", logSHOamp - logSHOw0)
+                
+                kernel = kernel + xo.gp.terms.SHOTerm(
+                    log_S0=logS0,
+                    log_Q=1/tt.sqrt(2),
+                    log_w0=logSHOw0
+                )
+                J = 6
+            else:
+                J = 4
+            
+            gp = xo.gp.GP(kernel, self.t, self.yerr**2 + tt.exp(logs2), J=J)
 
             # Compute the Gaussian Process likelihood and add it into the
             # the PyMC3 model as a "potential"
             pm.Potential("loglike", gp.log_likelihood(self.flux))
 
             # Compute the mean model prediction for plotting purposes
-            pm.Deterministic("mu", gp.predict())
+            #pm.Deterministic("mu", gp.predict())
             map_soln = xo.optimize(start=model.test_point)
             return model, map_soln
         
@@ -142,7 +209,6 @@ class LightCurve:
         with self.model:
             sampler.tune(tune=tune, start=self.map_soln, step=xo.get_dense_nuts_step(), step_kwargs=dict(target_accept=target_accept))
             trace = sampler.sample(draws=draws)
-            #trace = pm.sample(tune=tune, draws=draws, step=xo.get_dense_nuts_step())
         return trace
     
     def predict(self, t=None, return_var=True):
@@ -158,5 +224,9 @@ class LightCurve:
             )
             gp = xo.gp.GP(kernel, self.t, self.yerr**2 + tt.exp(self.map_soln["logs2"]), J=4)
             gp.log_likelihood(self.flux)
-            mu, var = xo.eval_in_model(gp.predict(t, return_var=return_var), self.map_soln)
-            return mu, var
+            if return_var:
+                mu, var = xo.eval_in_model(gp.predict(t, return_var=True), self.map_soln)
+                return mu, var
+            else:
+                mu = xo.eval_in_model(gp.predict(t, return_var=False), self.map_soln)
+                return mu
