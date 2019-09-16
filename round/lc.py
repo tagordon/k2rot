@@ -5,17 +5,21 @@ import exoplanet as xo
 import pymc3 as pm
 import theano.tensor as tt
 import corner
+import os
+import datetime
 from scipy.optimize import curve_fit
 from scipy.signal import medfilt
 from scipy.stats import sigmaclip
 from astropy.stats import sigma_clip
 
 class LightCurve:
-    def __init__(self, t, flux, yerr=None):
+    def __init__(self, t, flux, ident, telescope, yerr=None):
         self.t = t
         self.raw_t = t
         self.raw_flux = flux
         self.varnames = ["mix", "logdeltaQ", "logQ0", "logperiod", "logamp", "logs2"]
+        self.ident = ident
+        self.telescope = telescope
         self.flux = None
         self.masked = None
         self.yerr = None
@@ -26,29 +30,63 @@ class LightCurve:
         self.mcmc_summary = None
         self.computed = False
         self.hasmcmc = False
+        self.normalized = False
+        self.acfpeaks = None
     
     @classmethod
     def everest(cls, everest_fits):
         with fits.open(everest_fits) as hdus:
-            data = hdus[1].data
+            data = hdus[1].datap
             hdr = hdus[1].header
         t = data["TIME"]
         flux = data["FLUX"]
         m = (data["QUALITY"] == 0) & np.isfinite(t) & np.isfinite(flux)
         t = np.ascontiguousarray(t[m], dtype=np.float64)
         flux = np.ascontiguousarray(flux[m], dtype=np.float64)
-        return cls(t, flux)
+        ident = hdr["KEPLERID"]
+        return cls(t, flux, ident, "KEPLER")
     
-    def compute(self, mcmc=False, mcmc_draws=500, tune=500, target_accept=0.9, prior_sig=5.0, with_SHOTerm=False):
+    @classmethod 
+    def TESS(cls, tess_fits):
+        with fits.open(tess_fits) as hdus:
+            data = hdus[1].data
+            hdr = hdus[1].header
+        t = data["TIME"]
+        flux = data["PDCSAP_FLUX"]
+        m = (data["QUALITY"] == 0) & np.isfinite(t) & np.isfinite(flux)
+        t = np.ascontiguousarray(t[m], dtype=np.float64)
+        flux = np.ascontiguousarray(flux[m], dtype=np.float64)
+        ident = hdr["TICID"]
+        return cls(t, flux, ident, "TESS")
+    
+    @classmethod 
+    def concatenate(cls, lcs):
+        if any([lc.normalized is None for lc in lcs]):
+            raise Exception("All light curves must be normalized before concatenation")
+        t, flux = np.array([]), np.array([])
+        ident = lcs[0].ident
+        telescope = ""
+        for lc in lcs:
+            np.append(t, lc.t)
+            np.append(t, lc.flux)
+            telescope = telescope + lc.telescope
+        return cls(t, flux, ident, telescope)
+            
+            
+    def normalize(self):
         self.trend = self.get_trend(3)
         self.flux = (self.raw_flux-self.trend)/np.median(self.raw_flux)
         self.masked, self.yerr = self.estimate_yerr()
         self.flux = self.flux[self.masked == False]
         self.t = self.t[self.masked == False]
         self.yerr = self.yerr*np.ones(len(self.t))
+        self.normalized = True
+    
+    def compute(self, mcmc=False, mcmc_draws=500, tune=500, target_accept=0.9, prior_sig=5.0, with_SHOTerm=False, cores=4):
+        self.normalize()
         self.model, self.map_soln = self.build_model(prior_sig=prior_sig, with_SHOTerm=with_SHOTerm)
         if mcmc:
-            self.trace = self.mcmc(draws=mcmc_draws, tune=tune, target_accept=target_accept)
+            self.trace = self.mcmc(draws=mcmc_draws, tune=tune, target_accept=target_accept, cores=cores)
             self.mcmc_summary = pm.summary(self.trace, varnames=self.varnames)
             self.hasmcmc=True
         self.computed = True
@@ -65,6 +103,23 @@ class LightCurve:
             for j in range(nvar):
                 columns[i+1] += "\n{0:0.3f}".format(self.mcmc_summary.values[j, i])
         return columns
+    
+    def write_summary_string(self, file, campaignnum):
+        if not os.path.isfile(file):
+            with open(file, "w") as f:
+                f.write("Generated with round.py version 0.1 on {0}\n".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
+                f.write("Campaign: {0}\n".format(campaignnum))
+                f.write("EPIC number   \tvariable name\tmean    \tsd      \tmc_error\thpd_2.5 \thpd_97.5\tn_eff   \tRhat    \n\n")
+        if not self.hasmcmc:
+            raise Exception("Must first run mcmc")
+        with open(file, "a+") as f:
+            epicnum = ["EPIC " + str(self.ident)]
+            sumstring = [np.hstack((epicnum, self.varnames[i], self.mcmc_summary.values[i])) for i in range(len(self.mcmc_summary.values))]
+            fmtarray = ["%-8.8s"]*len(self.mcmc_summary.values[0])
+            fmtarray = ["%s", "%-13s"] + fmtarray
+            np.savetxt(f, sumstring, fmt=fmtarray, delimiter="\t")
+            sumstring = np.hstack((epicnum, ["acfpeak"], str(self.acfpeaks[0]["period"])))
+            np.savetxt(f, [sumstring], fmt=fmtarray[:3], delimiter="\t")
     
     def build_det_summary(self):
         if not self.hasmcmc:
@@ -114,15 +169,34 @@ class LightCurve:
         columns = self.build_mcmc_summary()
         corn = corner.corner(samples, *args, **kwargs)
         for i in range(len(columns)):
-            plt.annotate(columns[i], xy=(0.25+0.08*i, 0.865), xycoords="figure fraction", fontsize=12)
+            plt.annotate(columns[i], xy=(0.38+0.08*i, 0.7), xycoords="figure fraction", fontsize=12)
         columns = self.build_det_summary()
         for i in range(len(columns)):
-            plt.annotate(columns[i], xy=(0.41+0.08*i, 0.76), xycoords="figure fraction", fontsize=12)
+            plt.annotate(columns[i], xy=(0.55+0.08*i, 0.6), xycoords="figure fraction", fontsize=12)
+        plt.annotate("EPIC {0}".format(self.ident), xy=(0.4, 0.95), xycoords="figure fraction", fontsize=30)
         return corn
     
+    def write_summary_line(self):
+        if not self.hasmcmc:
+            raise Exception("Must first run mcmc by calling mcmc() or compute(mcmc=True) with mcmc=True")
+        samples = pm.trace_to_dataframe(self.trace, varnames=["mix", "logdeltaQ", "logQ0", "logperiod", "logamp", "logs2"])
+        
+    
     def get_trend(self, n):
-        res = np.polyfit(self.t, self.raw_flux, n)
-        return sum([c*(self.t**i) for (i, c) in enumerate(res[::-1])])
+        gaps = np.where((np.diff(self.t) > 10*(self.t[1]-self.t[0])) == True)[0]
+        gaps = np.concatenate([[0], gaps, [-1]])
+        res = np.zeros((len(gaps), n+1))
+        trend = []
+        for i in range(len(gaps)-1):
+            if gaps[i+1] == -1:
+                temp_t = self.t[gaps[i]:]
+                temp_flux = self.raw_flux[gaps[i]:]
+            else:
+                temp_t = self.t[gaps[i]:gaps[i+1]]
+                temp_flux = self.raw_flux[gaps[i]:gaps[i+1]]
+            res[i, :] = np.polyfit(temp_t, temp_flux, n)
+            trend = np.concatenate([trend, sum([c*(temp_t**i) for (i, c) in enumerate(res[i,:][::-1])])])
+        return trendcd
         
     def autocor(self, max_peaks=1, min_period=0.5, max_period=100):
         results = xo.autocorr_estimator(self.t, self.flux, 
@@ -135,9 +209,10 @@ class LightCurve:
     
     def plot_autocor(self, ax, *args, max_peaks=1, min_period=0.5, max_period=100, **kwargs):
         lags, power, peaks = self.autocor(max_peaks=max_peaks, min_period=min_period, max_period=max_period)
+        self.acfpeaks = peaks
         fig = plt.figure()
         ax.plot(lags, power, *args, **kwargs)
-        ax.axvline(peaks[0]["period"], color="#f55649", lw=5, alpha=0.6, label="chosen ACF peak")
+        ax.axvline(peaks[0]["period"], color="#f55649", lw=5, alpha=0.6, label="chosen ACF peak: {:<3.3f}".format(peaks[0]["period"]))
         return ax        
     
     def estimate_yerr(self, kernel_size=21, sigma=3):
@@ -201,14 +276,14 @@ class LightCurve:
 
             # Compute the mean model prediction for plotting purposes
             #pm.Deterministic("mu", gp.predict())
-            map_soln = xo.optimize(start=model.test_point)
+            map_soln = xo.optimize(start=model.test_point, verbose=False)
             return model, map_soln
         
-    def mcmc(self, draws=500, tune=500, target_accept=0.9):
+    def mcmc(self, draws=500, tune=500, target_accept=0.9, progressbar=False, cores=4):
         sampler = xo.PyMC3Sampler(finish=200)
         with self.model:
-            sampler.tune(tune=tune, start=self.map_soln, step=xo.get_dense_nuts_step(), step_kwargs=dict(target_accept=target_accept))
-            trace = sampler.sample(draws=draws)
+            sampler.tune(tune=tune, start=self.map_soln, step=xo.get_dense_nuts_step(), step_kwargs=dict(target_accept=target_accept), progressbar=progressbar, cores=cores)
+            trace = sampler.sample(draws=draws, progressbar=progressbar, cores=cores)
         return trace
     
     def predict(self, t=None, return_var=True):
