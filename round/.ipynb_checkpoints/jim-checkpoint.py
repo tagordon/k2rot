@@ -5,24 +5,19 @@ import sys
 import os
 import numpy as np
 
-indir = sys.argv[1]
-outdir = sys.argv[2]
-outname = sys.argv[3]
-ckptfile = ".ckpt_{0}".format(outname[-1])
-ckpt = np.genfromtxt('../ckpts/.ckpt_3', dtype=str)
-files = ckpt[:, 0][ckpt[:, 1] == '0']
-fileids = np.array(range(len(ckpt)))[ckpt[:, 1] == '0']
 
-files = os.listdir(indir)
-nf = len(ckpt)
-outfile = outdir + "/" + outname
-for i, f in zip(fileids, files):
-    abspath = indir + "/" + f
-    kid = f.split("_")[4].split("-")[0]
-    print("computing {0} of {1} lightcurves\n EPIC {2}".format(i+1, nf, kid))
-    summaryfile = kid + "_summary.png"
-    cornerfile = kid + "_corner.png"
-    light_curve = lc.LightCurve.everest(abspath)
+
+epic_ids = ["211972086", "212002525", "211946007", "212009427"]
+campaigns = ["05", "05", "05", "05"]
+nf = len(epic_ids)
+outfile = "test.dat"
+
+for i, eid in enumerate(epic_ids):
+    url = "https://archive.stsci.edu/hlsps/everest/v2/c" + campaigns[i] + "/" + eid[:4] + "00000/" + eid[4:] + "/hlsp_everest_k2_llc_" + eid + "-c" + campaigns[i] + "_kepler_v2.0_lc.fits"
+    print("computing {0} of {1} lightcurves\n EPIC {2}".format(i+1, nf, eid))
+    summaryfile = eid + "_summary.png"
+    cornerfile = eid + "_corner.png"
+    light_curve = lc.LightCurve.everest(url)
     light_curve.compute(mcmc=True, mcmc_draws=500, tune=500, 
                         target_accept=0.9, prior_sig=3.0, 
                         with_SHOTerm=False, cores=28)
@@ -97,6 +92,4 @@ for i, f in zip(fileids, files):
                             truth_color="#f55649");
     plt.savefig("{0}/{1}".format(outdir, cornerfile), dpi=200)
     plt.clf()
-    
-    ckpt[1, i] = '1'
-    np.savetxt(ckptfile, ckpt, fmt="%s")
+

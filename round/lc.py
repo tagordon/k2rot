@@ -11,6 +11,7 @@ from scipy.optimize import curve_fit
 from scipy.signal import medfilt
 from scipy.stats import sigmaclip
 from astropy.stats import sigma_clip
+from copy import deepcopy
 
 class LightCurve:
     def __init__(self, t, flux, ident, telescope, yerr=None):
@@ -32,11 +33,19 @@ class LightCurve:
         self.hasmcmc = False
         self.normalized = False
         self.acfpeaks = None
+        self.maxpeak = None
+        self.lags = None
+        self.power = None
+        
+    def __getitem__(self, key):
+        new_lc = deepcopy(self)
+        new_lc.__init__(self.t[key], self.raw_flux[key], self.ident, self.telescope)
+        return new_lc
     
     @classmethod
     def everest(cls, everest_fits):
         with fits.open(everest_fits) as hdus:
-            data = hdus[1].datap
+            data = hdus[1].data
             hdr = hdus[1].header
         t = data["TIME"]
         flux = data["FLUX"]
@@ -73,8 +82,11 @@ class LightCurve:
         return cls(t, flux, ident, telescope)
             
             
-    def normalize(self):
-        self.trend = self.get_trend(3)
+    def normalize(self, trendgaps=False):
+        if trendgaps == False:
+            self.trend = self.get_trend_nogaps(3)
+        else:
+            self.trend = self.get_trend(3)
         self.flux = (self.raw_flux-self.trend)/np.median(self.raw_flux)
         self.masked, self.yerr = self.estimate_yerr()
         self.flux = self.flux[self.masked == False]
@@ -82,9 +94,9 @@ class LightCurve:
         self.yerr = self.yerr*np.ones(len(self.t))
         self.normalized = True
     
-    def compute(self, mcmc=False, mcmc_draws=500, tune=500, target_accept=0.9, prior_sig=5.0, with_SHOTerm=False, cores=4):
-        self.normalize()
-        self.model, self.map_soln = self.build_model(prior_sig=prior_sig, with_SHOTerm=with_SHOTerm)
+    def compute(self, trendgaps=False, mcmc=False, mcmc_draws=500, tune=500, target_accept=0.9, prior_sig=5.0, maxper=50.0, with_SHOTerm=False, cores=4):
+        self.normalize(trendgaps=trendgaps)
+        self.model, self.map_soln = self.build_model(prior_sig=prior_sig, maxper=maxper, with_SHOTerm=with_SHOTerm)
         if mcmc:
             self.trace = self.mcmc(draws=mcmc_draws, tune=tune, target_accept=target_accept, cores=cores)
             self.mcmc_summary = pm.summary(self.trace, varnames=self.varnames)
@@ -118,7 +130,7 @@ class LightCurve:
             fmtarray = ["%-8.8s"]*len(self.mcmc_summary.values[0])
             fmtarray = ["%s", "%-13s"] + fmtarray
             np.savetxt(f, sumstring, fmt=fmtarray, delimiter="\t")
-            sumstring = np.hstack((epicnum, ["acfpeak"], str(self.acfpeaks[0]["period"])))
+            sumstring = np.hstack((epicnum, ["acfpeak"], str(self.maxpeak)))
             np.savetxt(f, [sumstring], fmt=fmtarray[:3], delimiter="\t")
     
     def build_det_summary(self):
@@ -196,23 +208,45 @@ class LightCurve:
                 temp_flux = self.raw_flux[gaps[i]:gaps[i+1]]
             res[i, :] = np.polyfit(temp_t, temp_flux, n)
             trend = np.concatenate([trend, sum([c*(temp_t**i) for (i, c) in enumerate(res[i,:][::-1])])])
-        return trendcd
+        return trend
+    
+    def get_trend_nogaps(self, n):
+        res = np.polyfit(self.t, self.raw_flux, n)
+        trend = sum([c*(self.t**i) for (i, c) in enumerate(res[::-1])])
+        return trend
         
-    def autocor(self, max_peaks=1, min_period=0.5, max_period=100):
+    def autocor(self, max_peaks=1, min_period=0.5):
         results = xo.autocorr_estimator(self.t, self.flux, 
                                         max_peaks=max_peaks, 
-                                        min_period=min_period, 
-                                        max_period=max_period)
-        lags, power = results["autocorr"]
-        peaks = results["peaks"]
-        return lags, power, peaks
+                                        min_period=min_period)
+        self.lags, self.power = results["autocorr"]
     
-    def plot_autocor(self, ax, *args, max_peaks=1, min_period=0.5, max_period=100, **kwargs):
-        lags, power, peaks = self.autocor(max_peaks=max_peaks, min_period=min_period, max_period=max_period)
-        self.acfpeaks = peaks
+    def get_peaks(self, max_peaks=1, min_period=0.5):
+        peak_ind = np.array(range(1, len(self.power)-1))[[(self.power[i+1] < self.power[i]) & (self.power[i-1] < self.power[i]) for i in range(1, len(self.power)-1)]]
+        trough_ind = np.array(range(1, len(self.power)-1))[[(self.power[i+1] > self.power[i]) & (self.power[i-1] > self.power[i]) for i in range(1, len(self.power)-1)]]
+
+        peaks = self.lags[1:][peak_ind]
+        troughs = self.lags[1:][trough_ind]
+
+        if (len(troughs) == 0) or (len(peaks) == 0):
+            return [], [], [] 
+        if len(troughs) == len(peaks):
+            if troughs[0] < peaks[0]:
+                troughs = np.append(troughs, self.power[-1])
+                trough_ind = np.append(trough_ind, len(self.power)-1)
+            if troughs[0] > peaks[0]:
+                troughs = np.insert(troughs, 0, self.power[0])
+                trough_ind = np.insert(trough_ind, 0, 0)
+        heights = np.array([2*self.power[peak_ind[i]] - self.power[trough_ind[i]] - self.power[trough_ind[i+1]] for i in range(len(troughs)-1)])
+        return peaks, troughs, heights
+    
+    def plot_autocor(self, ax, *args, max_peaks=1, min_period=0.5, maxper=50.0, **kwargs):
+        if not self.computed:
+            raise Exception("Must first call compute()")
         fig = plt.figure()
-        ax.plot(lags, power, *args, **kwargs)
-        ax.axvline(peaks[0]["period"], color="#f55649", lw=5, alpha=0.6, label="chosen ACF peak: {:<3.3f}".format(peaks[0]["period"]))
+        ax.plot(self.lags[self.lags < maxper], self.power[self.lags < maxper], *args, **kwargs)
+        if self.maxpeak is not None:
+            ax.axvline(self.maxpeak, color="#f55649", lw=5, alpha=0.6, label="chosen ACF peak: {:<3.3f}".format(self.maxpeak))
         return ax        
     
     def estimate_yerr(self, kernel_size=21, sigma=3):
@@ -222,8 +256,23 @@ class LightCurve:
         long_clipped_arr = sigma_clip(self.flux-longfilt, sigma=sigma)
         return long_clipped_arr.mask, np.std(clipped_arr.data[clipped_arr.mask == 0])
     
-    def build_model(self, prior_sig=5.0, with_SHOTerm=True):
-        lags, power, peaks = self.autocor()
+    def build_model(self, prior_sig=5.0, maxper=50.0, with_SHOTerm=True):
+        self.autocor(min_period=0.5)
+        peaks, troughs, heights = self.get_peaks()
+        self.acfpeaks = peaks
+        if len(peaks) == 0:
+            startperiod = np.mean(self.t)
+        else:
+            halfper = (self.t[-1]-self.t[0])/2.0
+            if halfper < maxper:
+                maxper = (self.t[-1]-self.t[0])/2.0
+            searchpeaks = peaks[peaks < maxper]
+            searchheights = heights[peaks < maxper]
+            if len(searchheights) > 0:
+                self.maxpeak = searchpeaks[searchheights == max(searchheights)][0]
+                startperiod = self.maxpeak
+            else:
+                startperiod = np.mean(self.t)
         with pm.Model() as model:
 
             #mean = pm.Normal("mean", mu=0.0, sd=10.0)
@@ -231,8 +280,8 @@ class LightCurve:
 
             # The parameters of the RotationTerm kernel
             logamp = pm.Normal("logamp", mu=np.log(np.var(self.flux)), sd=prior_sig)
-            BoundedNormal = pm.Bound(pm.Normal, lower=0.0, upper=np.log(50))
-            logperiod = BoundedNormal("logperiod", mu=np.log(peaks[0]["period"]), sd=prior_sig)
+            BoundedNormal = pm.Bound(pm.Normal, lower=0.0, upper=np.log(maxper))
+            logperiod = BoundedNormal("logperiod", mu=np.log(startperiod), sd=prior_sig)
             logQ0 = pm.Normal("logQ0", mu=1.0, sd=2*prior_sig)
             logdeltaQ = pm.Normal("logdeltaQ", mu=2.0, sd=2*prior_sig)
             mix = pm.Uniform("mix", lower=0, upper=1.0)
