@@ -62,3 +62,6 @@ def Angus2015(B_V, age):
     P = (age ** 0.55) * 0.4 * ((B_V - 0.45) ** 0.31)
 
     return P
+
+def Gordon2019(B_V):
+    return 12.2*B_V**1.8
