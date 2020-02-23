@@ -243,7 +243,6 @@ class LightCurve:
     def plot_autocor(self, ax, *args, max_peaks=1, min_period=0.5, maxper=50.0, **kwargs):
         if not self.computed:
             raise Exception("Must first call compute()")
-        fig = plt.figure()
         ax.plot(self.lags[self.lags < maxper], self.power[self.lags < maxper], *args, **kwargs)
         if self.maxpeak is not None:
             ax.axvline(self.maxpeak, color="#f55649", lw=5, alpha=0.6, label="chosen ACF peak: {:<3.3f}".format(self.maxpeak))
@@ -331,7 +330,8 @@ class LightCurve:
     def mcmc(self, draws=500, tune=500, target_accept=0.9, progressbar=False, cores=4):
         sampler = xo.PyMC3Sampler(finish=200)
         with self.model:
-            sampler.tune(tune=tune, start=self.map_soln, step=xo.get_dense_nuts_step(), step_kwargs=dict(target_accept=target_accept), progressbar=progressbar, cores=cores)
+            #sampler.tune(tune=tune, start=self.map_soln, step=xo.get_dense_nuts_step(), step_kwargs=dict(target_accept=target_accept), progressbar=progressbar, cores=cores)
+            sampler.tune(tune=tune, start=self.map_soln, step_kwargs=dict(target_accept=target_accept), progressbar=progressbar, cores=cores)
             trace = sampler.sample(draws=draws, progressbar=progressbar, cores=cores)
         return trace
     
