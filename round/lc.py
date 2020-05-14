@@ -18,7 +18,9 @@ class LightCurve:
         self.t = t
         self.raw_t = t
         self.raw_flux = flux
-        self.varnames = ["mix", "logdeltaQ", "logQ0", "logperiod", "logamp", "logs2"]
+        self.varnames = ["mix", "logdeltaQ", 
+                         "logQ0", "logperiod", 
+                         "logamp", "logs2"]
         self.ident = ident
         self.telescope = telescope
         self.flux = None
@@ -39,7 +41,10 @@ class LightCurve:
         
     def __getitem__(self, key):
         new_lc = deepcopy(self)
-        new_lc.__init__(self.t[key], self.raw_flux[key], self.ident, self.telescope)
+        new_lc.__init__(self.t[key], 
+                        self.raw_flux[key], 
+                        self.ident, 
+                        self.telescope)
         return new_lc
     
     @classmethod
@@ -49,7 +54,9 @@ class LightCurve:
             hdr = hdus[1].header
         t = data["TIME"]
         flux = data["FLUX"]
-        m = (data["QUALITY"] == 0) & np.isfinite(t) & np.isfinite(flux)
+        m = ((data["QUALITY"] == 0) & 
+             np.isfinite(t) & 
+             np.isfinite(flux))
         t = np.ascontiguousarray(t[m], dtype=np.float64)
         flux = np.ascontiguousarray(flux[m], dtype=np.float64)
         ident = hdr["KEPLERID"]
@@ -62,16 +69,33 @@ class LightCurve:
             hdr = hdus[1].header
         t = data["TIME"]
         flux = data["PDCSAP_FLUX"]
-        m = (data["QUALITY"] == 0) & np.isfinite(t) & np.isfinite(flux)
+        m = ((data["QUALITY"] == 0) & 
+             np.isfinite(t) & 
+             np.isfinite(flux))
         t = np.ascontiguousarray(t[m], dtype=np.float64)
         flux = np.ascontiguousarray(flux[m], dtype=np.float64)
         ident = hdr["TICID"]
         return cls(t, flux, ident, "TESS")
     
+    @classmethod
+    def TESS_adap(cls, tess_fits):
+        with fits.open(tess_fits) as hdus:
+            data = hdus[1].data
+        t = np.array([d[0] for d in data])
+        flux = np.array([d[1] for d in data])
+        quality = np.array([d[2] for d in data])
+        m = (quality == 0) & np.isfinite(t) & np.isfinite(flux)
+        t = np.ascontiguousarray(t[m], dtype=np.float64)
+        flux = np.ascontiguousarray(flux[m], dtype=np.float64)
+        ident = tess_fits.split("/")[-1].split('-')[0]
+        return cls(t, flux, ident, "TESS")
+    
     @classmethod 
     def concatenate(cls, lcs):
         if any([lc.normalized is None for lc in lcs]):
-            raise Exception("All light curves must be normalized before concatenation")
+            raise Exception("All light curves must \
+                            be normalized before \
+                            concatenation")
         t, flux = np.array([]), np.array([])
         ident = lcs[0].ident
         telescope = ""
@@ -83,23 +107,41 @@ class LightCurve:
             
             
     def normalize(self, trendgaps=False):
-        if trendgaps == False:
-            self.trend = self.get_trend_nogaps(3)
-        else:
-            self.trend = self.get_trend(3)
-        self.flux = (self.raw_flux-self.trend)/np.median(self.raw_flux)
-        self.masked, self.yerr = self.estimate_yerr()
-        self.flux = self.flux[self.masked == False]
-        self.t = self.t[self.masked == False]
-        self.yerr = self.yerr*np.ones(len(self.t))
-        self.normalized = True
+        if not self.normalized:
+            if trendgaps == False:
+                self.trend = self.get_trend_nogaps(3, raw=True)
+            else:
+                self.trend = self.get_trend(3, raw=True)
+            self.flux = (self.raw_flux-self.trend)/np.median(self.raw_flux)
+            self.masked, self.yerr = self.estimate_yerr()
+            self.flux = self.flux[self.masked == False]
+            self.t = self.t[self.masked == False]
+            if trendgaps == False:
+                self.trend = self.get_trend_nogaps(3)
+            else:
+                self.trend = self.get_trend(3)
+            self.yerr = self.yerr*np.ones(len(self.t))
+            self.normalized = True
     
-    def compute(self, trendgaps=False, mcmc=False, mcmc_draws=500, tune=500, target_accept=0.9, prior_sig=5.0, maxper=50.0, with_SHOTerm=False, cores=4):
+    def compute(self, trendgaps=False, 
+                min_period=0.5, mcmc=False, 
+                mcmc_draws=500, tune=500, 
+                target_accept=0.9, prior_sig=5.0, 
+                maxper=50.0, with_SHOTerm=False, 
+                cores=4, progressbar=True):
         self.normalize(trendgaps=trendgaps)
-        self.model, self.map_soln = self.build_model(prior_sig=prior_sig, maxper=maxper, with_SHOTerm=with_SHOTerm)
+        self.model, self.map_soln = self.build_model(prior_sig=prior_sig, 
+                                                     maxper=maxper, 
+                                                     with_SHOTerm=with_SHOTerm, 
+                                                     min_period=min_period)
         if mcmc:
-            self.trace = self.mcmc(draws=mcmc_draws, tune=tune, target_accept=target_accept, cores=cores)
-            self.mcmc_summary = pm.summary(self.trace, varnames=self.varnames)
+            self.trace = self.mcmc(draws=mcmc_draws, 
+                                   tune=tune, 
+                                   target_accept=target_accept, 
+                                   cores=cores, 
+                                   progressbar=progressbar)
+            self.mcmc_summary = pm.summary(self.trace, 
+                                           varnames=self.varnames)
             self.hasmcmc=True
         self.computed = True
         
@@ -108,7 +150,9 @@ class LightCurve:
             raise Exception("Must first run mcmc")
         nvar = len(self.varnames)
         ncols = 7
-        columns = ["variable\n", "mean\n", "sd\n", "mc_error\n", "hpd_2.5\n", "hpd_97.5\n", "n_eff\n", "Rhat\n"]
+        columns = ["variable\n", "mean\n", "sd\n", 
+                   "mc_error\n", "hpd_2.5\n", 
+                   "hpd_97.5\n", "n_eff\n", "Rhat\n"]
         for i in range(nvar):
             columns[0] += "\n{0}".format(self.varnames[i])
         for i in range(ncols):
@@ -121,12 +165,13 @@ class LightCurve:
             with open(file, "w") as f:
                 f.write("Generated with round.py version 0.1 on {0}\n".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
                 f.write("Campaign: {0}\n".format(campaignnum))
-                f.write("EPIC number   \tvariable name\tmean    \tsd      \tmc_error\thpd_2.5 \thpd_97.5\tn_eff   \tRhat    \n\n")
+                f.write("EPIC number  \tvariable name\tmean   \tsd     \tmc_error\thpd_2.5 \thpd_97.5\tn_eff  \tRhat    \n\n")
         if not self.hasmcmc:
             raise Exception("Must first run mcmc")
         with open(file, "a+") as f:
             epicnum = ["EPIC " + str(self.ident)]
-            sumstring = [np.hstack((epicnum, self.varnames[i], self.mcmc_summary.values[i])) for i in range(len(self.mcmc_summary.values))]
+            sumstring = [np.hstack((epicnum, self.varnames[i], self.mcmc_summary.values[i])) 
+                         for i in range(len(self.mcmc_summary.values))]
             fmtarray = ["%-8.8s"]*len(self.mcmc_summary.values[0])
             fmtarray = ["%s", "%-13s"] + fmtarray
             np.savetxt(f, sumstring, fmt=fmtarray, delimiter="\t")
@@ -149,6 +194,9 @@ class LightCurve:
         return columns
     
     def plot(self, ax, *args, **kwargs):
+        if not self.normalized:
+            ax.plot_raw(ax)
+            return ax
         ax.plot(self.t, self.flux, *args, **kwargs)
         return ax
     
@@ -165,7 +213,9 @@ class LightCurve:
             raise Exception("Must first call compute()")
         mu, var = self.predict(t=t, return_var=True)
         ax.plot(t, mu, *args, **kwargs)
-        ax.fill_between(t, mu+np.sqrt(var), mu-np.sqrt(var), *args, alpha=0.3, **kwargs)
+        ax.fill_between(t, mu+np.sqrt(var), 
+                        mu-np.sqrt(var), *args, 
+                        alpha=0.3, **kwargs)
         return ax
     
     def plot_residuals(self, ax, *args, **kwargs):
@@ -176,25 +226,36 @@ class LightCurve:
     
     def plot_corner(self, *args, **kwargs):
         if not self.hasmcmc:
-            raise Exception("Must first run mcmc by calling mcmc() or compute(mcmc=True) with mcmc=True")
-        samples = pm.trace_to_dataframe(self.trace, varnames=["mix", "logdeltaQ", "logQ0", "logperiod", "logamp", "logs2"])
+            raise Exception("Must first run mcmc by calling mcmc()\
+            or compute(mcmc=True) with mcmc=True")
+        samples = pm.trace_to_dataframe(self.trace, 
+                                        varnames=["mix", "logdeltaQ", 
+                                                  "logQ0", "logperiod", 
+                                                  "logamp", "logs2"])
         columns = self.build_mcmc_summary()
         corn = corner.corner(samples, *args, **kwargs)
         for i in range(len(columns)):
-            plt.annotate(columns[i], xy=(0.38+0.08*i, 0.7), xycoords="figure fraction", fontsize=12)
+            plt.annotate(columns[i], xy=(0.38+0.08*i, 0.7), 
+                         xycoords="figure fraction", fontsize=12)
         columns = self.build_det_summary()
         for i in range(len(columns)):
-            plt.annotate(columns[i], xy=(0.55+0.08*i, 0.6), xycoords="figure fraction", fontsize=12)
-        plt.annotate("EPIC {0}".format(self.ident), xy=(0.4, 0.95), xycoords="figure fraction", fontsize=30)
+            plt.annotate(columns[i], xy=(0.55+0.08*i, 0.6), 
+                         xycoords="figure fraction", fontsize=12)
+        plt.annotate("EPIC {0}".format(self.ident), xy=(0.4, 0.95), 
+                     xycoords="figure fraction", fontsize=30)
         return corn
     
     def write_summary_line(self):
         if not self.hasmcmc:
-            raise Exception("Must first run mcmc by calling mcmc() or compute(mcmc=True) with mcmc=True")
-        samples = pm.trace_to_dataframe(self.trace, varnames=["mix", "logdeltaQ", "logQ0", "logperiod", "logamp", "logs2"])
+            raise Exception("Must first run mcmc by calling mcmc()\
+            or compute(mcmc=True) with mcmc=True")
+        samples = pm.trace_to_dataframe(self.trace, 
+                                        varnames=["mix", "logdeltaQ", 
+                                                  "logQ0", "logperiod", 
+                                                  "logamp", "logs2"])
         
     
-    def get_trend(self, n):
+    def get_trend(self, n, raw=False):
         gaps = np.where((np.diff(self.t) > 10*(self.t[1]-self.t[0])) == True)[0]
         gaps = np.concatenate([[0], gaps, [-1]])
         res = np.zeros((len(gaps), n+1))
@@ -202,16 +263,25 @@ class LightCurve:
         for i in range(len(gaps)-1):
             if gaps[i+1] == -1:
                 temp_t = self.t[gaps[i]:]
-                temp_flux = self.raw_flux[gaps[i]:]
+                if raw:
+                    temp_flux = self.raw_flux[gaps[i]:]
+                else:
+                    temp_flux = self.flux[gaps[i]:]
             else:
                 temp_t = self.t[gaps[i]:gaps[i+1]]
-                temp_flux = self.raw_flux[gaps[i]:gaps[i+1]]
+                if raw:
+                    temp_flux = self.raw_flux[gaps[i]:gaps[i+1]]
+                else:
+                    temp_flux = self.flux[gaps[i]:gaps[i+1]]
             res[i, :] = np.polyfit(temp_t, temp_flux, n)
             trend = np.concatenate([trend, sum([c*(temp_t**i) for (i, c) in enumerate(res[i,:][::-1])])])
         return trend
     
-    def get_trend_nogaps(self, n):
-        res = np.polyfit(self.t, self.raw_flux, n)
+    def get_trend_nogaps(self, n, raw=False):
+        if raw:
+            res = np.polyfit(self.t, self.raw_flux, n)
+        else:
+            res = np.polyfit(self.t, self.flux, n)
         trend = sum([c*(self.t**i) for (i, c) in enumerate(res[::-1])])
         return trend
         
@@ -222,8 +292,12 @@ class LightCurve:
         self.lags, self.power = results["autocorr"]
     
     def get_peaks(self, max_peaks=1, min_period=0.5):
-        peak_ind = np.array(range(1, len(self.power)-1))[[(self.power[i+1] < self.power[i]) & (self.power[i-1] < self.power[i]) for i in range(1, len(self.power)-1)]]
-        trough_ind = np.array(range(1, len(self.power)-1))[[(self.power[i+1] > self.power[i]) & (self.power[i-1] > self.power[i]) for i in range(1, len(self.power)-1)]]
+        peak_ind = np.array(range(1, len(self.power)-1))[[(self.power[i+1] < self.power[i]) & 
+                                                          (self.power[i-1] < self.power[i]) 
+                                                          for i in range(1, len(self.power)-1)]]
+        trough_ind = np.array(range(1, len(self.power)-1))[[(self.power[i+1] > self.power[i]) & 
+                                                            (self.power[i-1] > self.power[i]) 
+                                                            for i in range(1, len(self.power)-1)]]
 
         peaks = self.lags[1:][peak_ind]
         troughs = self.lags[1:][trough_ind]
@@ -237,7 +311,10 @@ class LightCurve:
             if troughs[0] > peaks[0]:
                 troughs = np.insert(troughs, 0, self.power[0])
                 trough_ind = np.insert(trough_ind, 0, 0)
-        heights = np.array([2*self.power[peak_ind[i]] - self.power[trough_ind[i]] - self.power[trough_ind[i+1]] for i in range(len(troughs)-1)])
+        heights = np.array([2*self.power[peak_ind[i]] 
+                            - self.power[trough_ind[i]] 
+                            - self.power[trough_ind[i+1]] 
+                            for i in range(len(troughs)-1)])
         return peaks, troughs, heights
     
     def plot_autocor(self, ax, *args, max_peaks=1, min_period=0.5, maxper=50.0, **kwargs):
@@ -255,8 +332,8 @@ class LightCurve:
         long_clipped_arr = sigma_clip(self.flux-longfilt, sigma=sigma)
         return long_clipped_arr.mask, np.std(clipped_arr.data[clipped_arr.mask == 0])
     
-    def build_model(self, prior_sig=5.0, maxper=50.0, with_SHOTerm=True):
-        self.autocor(min_period=0.5)
+    def build_model(self, prior_sig=5.0, min_period=0.5, maxper=50.0, with_SHOTerm=True):
+        self.autocor(min_period=min_period)
         peaks, troughs, heights = self.get_peaks()
         self.acfpeaks = peaks
         if len(peaks) == 0:
@@ -279,7 +356,7 @@ class LightCurve:
 
             # The parameters of the RotationTerm kernel
             logamp = pm.Normal("logamp", mu=np.log(np.var(self.flux)), sd=prior_sig)
-            BoundedNormal = pm.Bound(pm.Normal, lower=0.0, upper=np.log(maxper))
+            BoundedNormal = pm.Bound(pm.Normal, lower=-20, upper=np.log(maxper))
             logperiod = BoundedNormal("logperiod", mu=np.log(startperiod), sd=prior_sig)
             logQ0 = pm.Normal("logQ0", mu=1.0, sd=2*prior_sig)
             logdeltaQ = pm.Normal("logdeltaQ", mu=2.0, sd=2*prior_sig)
